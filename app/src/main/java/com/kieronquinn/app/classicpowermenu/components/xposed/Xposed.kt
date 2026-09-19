@@ -1,5 +1,6 @@
 package com.kieronquinn.app.classicpowermenu.components.xposed
 
+import android.app.Dialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -8,6 +9,7 @@ import android.content.pm.ApplicationInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.view.WindowManager
 import com.kieronquinn.app.classicpowermenu.BuildConfig
 import com.kieronquinn.app.classicpowermenu.IGlobalActions
 import com.kieronquinn.app.classicpowermenu.service.globalactions.GlobalActionsService
@@ -19,6 +21,7 @@ class Xposed: IXposedHookLoadPackage, ServiceConnection {
 
     companion object {
         private const val TAG = "CPMXposed"
+        private const val EXTRA_OPLUS_REPLACED = "oplus_replaced"
     }
 
     private val serviceIntent by lazy {
@@ -34,6 +37,7 @@ class Xposed: IXposedHookLoadPackage, ServiceConnection {
     private var miuiVersion = -1
     private var oneuiVersion = -1
     private var oplusVersion = -1
+    private var isReplacingOplusDialog = false
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         miuiVersion = SystemProperties_getString("ro.miui.ui.version.name", "V0")
@@ -88,12 +92,14 @@ class Xposed: IXposedHookLoadPackage, ServiceConnection {
             )
             val contextField = XposedHelpers.findField(globalActionsClass, "mContext")
             val disabledField = XposedHelpers.findField(globalActionsClass, "mDisabled")
+            val dialogField = XposedHelpers.findField(globalActionsClass, "globalActionsDialog")
             val showMethod = globalActionsClass.getDeclaredMethod("showGlobalActions", managerClass)
             val disableMethod = globalActionsClass.getDeclaredMethod("disable",
                 Int::class.java, Int::class.java, Int::class.java, Boolean::class.java)
             val shownMethod = managerClass.getMethod("onGlobalActionsShown")
             Context::class.java.isAssignableFrom(contextField.type) &&
                 disabledField.type == Boolean::class.javaPrimitiveType &&
+                dialogField.type.name == "com.android.systemui.shutdown.GlobalActionsDialogEx" &&
                 showMethod.returnType == Void.TYPE && disableMethod.returnType == Void.TYPE &&
                 shownMethod.returnType == Void.TYPE && globalActionsClass.declaredConstructors.isNotEmpty()
         } catch (e: Exception) {
@@ -114,6 +120,23 @@ class Xposed: IXposedHookLoadPackage, ServiceConnection {
         )
         val contextField = XposedHelpers.findField(globalActionsClass, "mContext")
         val disabledField = XposedHelpers.findField(globalActionsClass, "mDisabled")
+        val dialogField = XposedHelpers.findField(globalActionsClass, "globalActionsDialog")
+
+        XposedBridge.hookMethod(Dialog::class.java.getDeclaredMethod("show"), object: XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!isReplacingOplusDialog || param.thisObject.javaClass.name !=
+                    "com.oplus.systemui.shutdown.OplusGlobalActionsDialog\$ActionsDialog") return
+                (param.thisObject as Dialog).window?.apply {
+                    decorView.alpha = 0f
+                    setWindowAnimations(0)
+                    clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                    attributes = attributes.apply {
+                        alpha = 0f
+                        dimAmount = 0f
+                    }
+                }
+            }
+        })
 
         XposedBridge.hookAllConstructors(globalActionsClass, object: XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
@@ -123,14 +146,29 @@ class Xposed: IXposedHookLoadPackage, ServiceConnection {
         XposedHelpers.findAndHookMethod(globalActionsClass, "showGlobalActions", managerClass, object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (disabledField.getBoolean(param.thisObject)) return
+                val context = contextField.get(param.thisObject) as Context
                 val currentService = service
                 if (currentService == null) {
-                    tryBindService(contextField.get(param.thisObject) as Context)
+                    tryBindService(context)
                     return
                 }
-                if (showGlobalActions(currentService)) {
-                    XposedHelpers.callMethod(param.args[0], "onGlobalActionsShown")
-                    param.result = null
+                val replaced = showGlobalActions(currentService)
+                param.setObjectExtra(EXTRA_OPLUS_REPLACED, replaced)
+                isReplacingOplusDialog = replaced
+            }
+
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    if (param.getObjectExtra(EXTRA_OPLUS_REPLACED) == true) {
+                        dialogField.get(param.thisObject)?.let {
+                            XposedHelpers.callMethod(it, "getActionsDialog")?.let { dialog ->
+                                XposedHelpers.callMethod(dialog, "dismiss")
+                            }
+                        }
+                        XposedHelpers.callMethod(param.args[0], "onGlobalActionsShown")
+                    }
+                } finally {
+                    isReplacingOplusDialog = false
                 }
             }
         })
